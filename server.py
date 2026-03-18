@@ -1,22 +1,50 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import requests
 import os
 import threading
 import time
 import yfinance as yf
 import pandas as pd
+import json
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 app = Flask(__name__)
 
+# =========================
+# 🔥 Firebase 初始化
+# =========================
+cred_json = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
+cred = credentials.Certificate(cred_json)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# =========================
+# LINE
+# =========================
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = "U4e491f83955e58fa292d0082ff332eaa"
-
-WATCHLIST = {}
 
 last_state = {}
 
 # =========================
-# 🚀 LINE 推播
+# 🔥 Firebase CRUD
+# =========================
+def get_watchlist():
+    docs = db.collection("stocks").stream()
+    result = {}
+    for doc in docs:
+        result[doc.id] = doc.to_dict()
+    return result
+
+def add_stock(code, data):
+    db.collection("stocks").document(code).set(data)
+
+def delete_stock(code):
+    db.collection("stocks").document(code).delete()
+
+# =========================
+# LINE 推播
 # =========================
 def send_line_message(text):
     url = 'https://api.line.me/v2/bot/message/push'
@@ -31,13 +59,12 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=body)
 
 # =========================
-# 🧠 指令解析
+# 指令
 # =========================
 def handle_command(text):
     try:
         parts = text.split()
 
-        # ===== 新增 =====
         if parts[0] == "新增":
             code = parts[1] + ".TW"
             name = parts[2]
@@ -45,40 +72,37 @@ def handle_command(text):
             stop_loss = float(parts[4])
             take_profit = float(parts[5])
 
-            WATCHLIST[code] = {
+            add_stock(code, {
                 "name": name,
                 "cost": cost,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit
-            }
+            })
 
-            return f"✅ 已新增 {name} ({code})"
+            return f"✅ 已新增 {name}"
 
-        # ===== 刪除 =====
         elif parts[0] == "刪除":
             code = parts[1] + ".TW"
-            WATCHLIST.pop(code, None)
+            delete_stock(code)
             return f"❌ 已刪除 {code}"
 
-        # ===== 查看 =====
         elif parts[0] == "持股":
-            if not WATCHLIST:
+            watchlist = get_watchlist()
+            if not watchlist:
                 return "目前沒有持股"
 
             msg = ""
-            for k,v in WATCHLIST.items():
+            for k,v in watchlist.items():
                 msg += f"{v['name']} ({k})\n成本:{v['cost']}\n\n"
-
             return msg
 
-        else:
-            return "指令錯誤\n\n用法:\n新增 2330 台積電 600 550 700"
+        return "指令錯誤"
 
     except:
-        return "格式錯誤\n範例:\n新增 2330 台積電 600 550 700"
+        return "格式錯誤\n範例：新增 2330 台積電 600 550 700"
 
 # =========================
-# 🚀 Webhook
+# Webhook
 # =========================
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -105,7 +129,7 @@ def webhook():
     return "OK"
 
 # =========================
-# 🧠 AI 分析
+# AI分析
 # =========================
 def analyze(code, config):
     try:
@@ -125,8 +149,6 @@ def analyze(code, config):
         latest = df.iloc[-1]
 
         price = latest['Close']
-        ma5 = latest['MA5']
-        ma20 = latest['MA20']
         rsi = latest['RSI']
 
         cost = config["cost"]
@@ -139,10 +161,6 @@ def analyze(code, config):
             decision = "🚨 停損"
         elif price > config["take_profit"]:
             decision = "💰 停利"
-        elif ma5 > ma20:
-            decision = "✅ 多頭"
-        else:
-            decision = "⚠️ 轉弱"
 
         state = f"{decision}-{round(profit,1)}"
 
@@ -164,11 +182,12 @@ RSI：{rsi:.1f}
         print(e)
 
 # =========================
-# 🚀 主迴圈
+# 主迴圈
 # =========================
 def bot_loop():
     while True:
-        for code, config in WATCHLIST.items():
+        watchlist = get_watchlist()
+        for code, config in watchlist.items():
             analyze(code, config)
 
         time.sleep(600)
@@ -176,7 +195,7 @@ def bot_loop():
 threading.Thread(target=bot_loop).start()
 
 # =========================
-# 🚀 啟動
+# 啟動
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
