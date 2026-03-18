@@ -42,3 +42,21 @@ def webhook():
     threading.Thread(target=process).start()
 
     return "OK", 200
+def send_line_message(text):
+    url = 'https://api.line.me/v2/bot/message/push'
+    headers = {
+        'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    body = {
+        "to": "U4e491f83955e58fa292d0082ff332eaa",
+        "messages":[
+            {
+                "type":"text",
+                "text": text
+            }
+        ]
+    }
+
+    requests.post(url, headers=headers, json=body)
+send_line_message("🚀 Trading Bot 上線成功！")
