@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import requests
 import os
 import threading
@@ -11,23 +11,12 @@ app = Flask(__name__)
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = "U4e491f83955e58fa292d0082ff332eaa"
 
-# =========================
-# 🔧 自選持股（改這裡🔥）
-# =========================
-WATCHLIST = {
-    "2330.TW": {"name": "台積電", "cost": 3237, "stop_loss": 2900, "take_profit": 4500},
-    "6770.TW": {"name": "力積電", "cost": 66.2, "stop_loss": 60, "take_profit": 80},
-    "3264.TW": {"name": "欣銓", "cost": 154.65, "stop_loss": 140, "take_profit": 180},
-    "3481.TW": {"name": "群創", "cost": 26.42, "stop_loss": 24, "take_profit": 35},
-    "3576.TW": {"name": "聯合再生", "cost": 23.89, "stop_loss": 20, "take_profit": 30},
-    "2485.TW": {"name": "兆赫", "cost": 61.2, "stop_loss": 55, "take_profit": 90},
-}
+WATCHLIST = {}
 
-# 防洗版
 last_state = {}
 
 # =========================
-# 🚀 LINE推播
+# 🚀 LINE 推播
 # =========================
 def send_line_message(text):
     url = 'https://api.line.me/v2/bot/message/push'
@@ -42,46 +31,85 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=body)
 
 # =========================
-# 🚀 Webhook（互動）
+# 🧠 指令解析
+# =========================
+def handle_command(text):
+    try:
+        parts = text.split()
+
+        # ===== 新增 =====
+        if parts[0] == "新增":
+            code = parts[1] + ".TW"
+            name = parts[2]
+            cost = float(parts[3])
+            stop_loss = float(parts[4])
+            take_profit = float(parts[5])
+
+            WATCHLIST[code] = {
+                "name": name,
+                "cost": cost,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
+
+            return f"✅ 已新增 {name} ({code})"
+
+        # ===== 刪除 =====
+        elif parts[0] == "刪除":
+            code = parts[1] + ".TW"
+            WATCHLIST.pop(code, None)
+            return f"❌ 已刪除 {code}"
+
+        # ===== 查看 =====
+        elif parts[0] == "持股":
+            if not WATCHLIST:
+                return "目前沒有持股"
+
+            msg = ""
+            for k,v in WATCHLIST.items():
+                msg += f"{v['name']} ({k})\n成本:{v['cost']}\n\n"
+
+            return msg
+
+        else:
+            return "指令錯誤\n\n用法:\n新增 2330 台積電 600 550 700"
+
+    except:
+        return "格式錯誤\n範例:\n新增 2330 台積電 600 550 700"
+
+# =========================
+# 🚀 Webhook
 # =========================
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
 
-    def process():
-        try:
-            for event in data.get("events", []):
-                if event["type"] == "message":
-                    reply_token = event["replyToken"]
-                    text = event["message"]["text"]
+    for event in data.get("events", []):
+        if event["type"] == "message":
+            reply_token = event["replyToken"]
+            text = event["message"]["text"]
 
-                    reply = f"📊 系統運作中\n你說：{text}"
+            reply = handle_command(text)
 
-                    url = 'https://api.line.me/v2/bot/message/reply'
-                    headers = {
-                        'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
-                        'Content-Type': 'application/json'
-                    }
-                    body = {
-                        'replyToken': reply_token,
-                        'messages': [{"type":"text","text": reply}]
-                    }
+            url = 'https://api.line.me/v2/bot/message/reply'
+            headers = {
+                'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
+                'Content-Type': 'application/json'
+            }
+            body = {
+                'replyToken': reply_token,
+                'messages': [{"type":"text","text": reply}]
+            }
+            requests.post(url, headers=headers, json=body)
 
-                    requests.post(url, headers=headers, json=body)
-        except Exception as e:
-            print(e)
-
-    threading.Thread(target=process).start()
-    return "OK", 200
+    return "OK"
 
 # =========================
-# 🧠 AI分析
+# 🧠 AI 分析
 # =========================
-def analyze(stock_code, config):
+def analyze(code, config):
     try:
-        stock = yf.Ticker(stock_code)
-        df = stock.history(period="1mo")
-
+        df = yf.Ticker(code).history(period="1mo")
         if len(df) < 20:
             return
 
@@ -101,50 +129,36 @@ def analyze(stock_code, config):
         ma20 = latest['MA20']
         rsi = latest['RSI']
 
-        name = config["name"]
         cost = config["cost"]
+        name = config["name"]
 
-        trend = "多頭" if ma5 > ma20 else "空頭"
+        profit = (price - cost) / cost * 100
 
-        if rsi > 70:
-            strength = "過熱"
-        elif rsi < 30:
-            strength = "超跌"
-        elif rsi > 50:
-            strength = "偏強"
+        decision = "觀察"
+        if price < config["stop_loss"]:
+            decision = "🚨 停損"
+        elif price > config["take_profit"]:
+            decision = "💰 停利"
+        elif ma5 > ma20:
+            decision = "✅ 多頭"
         else:
-            strength = "偏弱"
+            decision = "⚠️ 轉弱"
 
-        decision = "👀 觀察"
+        state = f"{decision}-{round(profit,1)}"
 
-        if price < cost:
-            decision = "🚨 跌破成本"
-        elif ma5 > ma20 and rsi < 70:
-            decision = "✅ 可續抱/加碼"
-        elif ma5 < ma20:
-            decision = "⚠️ 趨勢轉弱"
-        elif rsi > 70:
-            decision = "💰 建議停利"
-
-        # 狀態判斷（防洗版）
-        state = f"{trend}-{strength}-{decision}"
-
-        if last_state.get(stock_code) == state:
+        if last_state.get(code) == state:
             return
 
-        last_state[stock_code] = state
+        last_state[code] = state
 
         msg = f"""📊 {name}
 現價：{price:.2f}
-成本：{cost}
-趨勢：{trend}
-RSI：{rsi:.1f}（{strength}）
+報酬：{profit:.2f}%
+RSI：{rsi:.1f}
 判斷：{decision}
 """
 
         send_line_message(msg)
-
-        print(stock_code, msg)
 
     except Exception as e:
         print(e)
@@ -152,18 +166,18 @@ RSI：{rsi:.1f}（{strength}）
 # =========================
 # 🚀 主迴圈
 # =========================
-def trading_bot():
+def bot_loop():
     while True:
-        for stock_code, config in WATCHLIST.items():
-            analyze(stock_code, config)
+        for code, config in WATCHLIST.items():
+            analyze(code, config)
 
-        time.sleep(1800)  # 30分鐘
+        time.sleep(600)
+
+threading.Thread(target=bot_loop).start()
 
 # =========================
 # 🚀 啟動
 # =========================
-threading.Thread(target=trading_bot).start()
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
