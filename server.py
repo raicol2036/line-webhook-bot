@@ -16,7 +16,7 @@ USER_ID = "U4e491f83955e58fa292d0082ff332eaa"
 # =========================
 WATCHLIST = {
     "3264.TW": {"buy": 150, "stop_loss": 154, "take_profit": 165},
-    "7769.TW": {"buy": 4100, "stop_loss": 4300, "take_profit": 4450},
+    "7769.TW": {"buy": 4375, "stop_loss": 4300, "take_profit": 4450},
     "6770.TW": {"buy": 60, "stop_loss": 65, "take_profit": 80},
 }
 
