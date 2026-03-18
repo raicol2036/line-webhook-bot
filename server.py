@@ -63,14 +63,23 @@ def send_line_message(text):
 # =========================
 def handle_command(text):
     try:
+        text = text.strip()
         parts = text.split()
 
-        if parts[0] == "新增":
+        # 👉 新增
+        if text.startswith("新增"):
+            if len(parts) < 6:
+                return "格式錯誤\n範例：新增 2330 台積電 600 550 700"
+
             code = parts[1] + ".TW"
             name = parts[2]
-            cost = float(parts[3])
-            stop_loss = float(parts[4])
-            take_profit = float(parts[5])
+
+            try:
+                cost = float(parts[3])
+                stop_loss = float(parts[4])
+                take_profit = float(parts[5])
+            except:
+                return "數值錯誤（成本/停損/停利要是數字）"
 
             add_stock(code, {
                 "name": name,
@@ -81,25 +90,34 @@ def handle_command(text):
 
             return f"✅ 已新增 {name}"
 
-        elif parts[0] == "刪除":
+        # 👉 刪除
+        elif text.startswith("刪除"):
+            if len(parts) < 2:
+                return "格式錯誤：刪除 2330"
+
             code = parts[1] + ".TW"
             delete_stock(code)
             return f"❌ 已刪除 {code}"
 
-        elif parts[0] == "持股":
+        # 👉 持股
+        elif text.startswith("持股"):
             watchlist = get_watchlist()
+
             if not watchlist:
                 return "目前沒有持股"
 
             msg = ""
-            for k,v in watchlist.items():
+            for k, v in watchlist.items():
                 msg += f"{v['name']} ({k})\n成本:{v['cost']}\n\n"
+
             return msg
 
-        return "指令錯誤"
+        else:
+            return "指令錯誤\n\n用法：新增 2330 台積電 600 550 700"
 
-    except:
-        return "格式錯誤\n範例：新增 2330 台積電 600 550 700"
+    except Exception as e:
+        print("❌ ERROR:", e)
+        return "系統錯誤"
 
 # =========================
 # Webhook
