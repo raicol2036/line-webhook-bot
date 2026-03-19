@@ -9,7 +9,7 @@ import yfinance as yf
 app = Flask(__name__)
 
 # =========================
-# 🔥 Firebase 初始化（100%穩）
+# 🔥 Firebase
 # =========================
 db = None
 
@@ -29,33 +29,35 @@ except Exception as e:
     print("❌ Firebase error:", e)
 
 # =========================
-# 🔥 LINE 設定
+# 🔥 LINE
 # =========================
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_TOKEN")
 
 def reply_line(reply_token, text):
-    url = 'https://api.line.me/v2/bot/message/reply'
-    headers = {
-        'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    body = {
-        "replyToken": reply_token,
-        "messages":[{"type":"text","text": text}]
-    }
-    requests.post(url, headers=headers, json=body)
+    requests.post(
+        'https://api.line.me/v2/bot/message/reply',
+        headers={
+            'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
+            'Content-Type': 'application/json'
+        },
+        json={
+            "replyToken": reply_token,
+            "messages":[{"type":"text","text": text}]
+        }
+    )
 
 def push_line(user_id, text):
-    url = 'https://api.line.me/v2/bot/message/push'
-    headers = {
-        'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    body = {
-        "to": user_id,
-        "messages":[{"type":"text","text": text}]
-    }
-    requests.post(url, headers=headers, json=body)
+    requests.post(
+        'https://api.line.me/v2/bot/message/push',
+        headers={
+            'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
+            'Content-Type': 'application/json'
+        },
+        json={
+            "to": user_id,
+            "messages":[{"type":"text","text": text}]
+        }
+    )
 
 # =========================
 # 🔥 Firebase CRUD
@@ -71,69 +73,9 @@ def delete_stock(user_id, stock_id):
     db.collection("users").document(user_id).collection("stocks").document(stock_id).delete()
 
 # =========================
-# 📊 股票資料
+# 📊 分析核心
 # =========================
-def get_price(code):
-    try:
-        return yf.Ticker(code).history(period="1d")["Close"].iloc[-1]
-    except:
-        return None
-
-# =========================
-# 🤖 指令解析（完全修正版）
-# =========================
-def handle_command(text, user_id):
-    try:
-        text = text.strip()
-        parts = text.split()
-
-        # =====================
-        # 新增股票
-        # =====================
-        if text.startswith("新增"):
-            if len(parts) != 6:
-                return "❌ 用法：新增 2330 台積電 600 700 550"
-
-            _, stock_id, name, cost, take_profit, stop_loss = parts
-
-            code = stock_id + ".TW"
-
-            add_stock(user_id, code, {
-                "name": name,
-                "cost": float(cost),
-                "take_profit": float(take_profit),
-                "stop_loss": float(stop_loss)
-            })
-
-            return f"✅ 已新增 {name} ({stock_id})"
-
-        # =====================
-        # 持股
-        # =====================
-        elif text == "持股":
-            stocks = get_user_stocks(user_id)
-
-            if not stocks:
-                return "目前沒有持股"
-
-            msg = "📊 持股列表\n\n"
-            for code, data in stocks.items():
-                msg += f"{data['name']} ({code})\n成本:{data['cost']}\n\n"
-
-            return msg
-
-        # =====================
-        # 刪除
-        # =====================
-        elif text.startswith("刪除"):
-            stock_id = parts[1] + ".TW"
-            delete_stock(user_id, stock_id)
-            return f"❌ 已刪除 {parts[1]}"
-
-        # =====================
-        # 分析
-        # =====================
-def analyze_decision(stock_id):
+def analyze_decision(stock_id, config=None):
     try:
         code = stock_id + ".TW"
         df = yf.Ticker(code).history(period="1mo")
@@ -141,7 +83,6 @@ def analyze_decision(stock_id):
         if df.empty:
             return f"❌ 抓不到 {stock_id}"
 
-        # 指標
         df['MA5'] = df['Close'].rolling(5).mean()
         df['MA20'] = df['Close'].rolling(20).mean()
 
@@ -158,11 +99,33 @@ def analyze_decision(stock_id):
         ma20 = latest['MA20']
         rsi = latest['RSI']
 
-        # 🔥 判斷
+        decision = ""
+        if config:
+            cost = config["cost"]
+            profit = (price - cost) / cost * 100
+
+            if price < config["stop_loss"]:
+                decision = "🚨 停損"
+            elif price > config["take_profit"]:
+                decision = "💰 停利"
+            elif ma5 < ma20:
+                decision = "⚠️ 轉弱"
+            else:
+                decision = "✅ 續抱"
+
+            return f"""📊 {config['name']}
+現價：{price:.2f}
+報酬：{profit:.2f}%
+RSI：{rsi:.1f}
+
+👉 建議：{decision}
+"""
+
+        # 單純查詢
         if rsi > 80:
             decision = "⚠️ 過熱建議賣出"
         elif ma5 < ma20:
-            decision = "⚠️ 轉弱（減碼）"
+            decision = "⚠️ 轉弱"
         else:
             decision = "✅ 多頭續抱"
 
@@ -178,7 +141,94 @@ RSI：{rsi:.1f}
         return "❌ 系統錯誤"
 
 # =========================
-# 🔥 Webhook（關鍵）
+# 🤖 指令
+# =========================
+def handle_command(text, user_id):
+    text = text.strip()
+    parts = text.split()
+
+    try:
+        # 新增
+        if text.startswith("新增"):
+            if len(parts) != 6:
+                return "❌ 用法：新增 2330 台積電 600 700 550"
+
+            _, stock_id, name, cost, tp, sl = parts
+
+            add_stock(user_id, stock_id + ".TW", {
+                "name": name,
+                "cost": float(cost),
+                "take_profit": float(tp),
+                "stop_loss": float(sl)
+            })
+
+            return f"✅ 已新增 {name}"
+
+        # 持股
+        elif text == "持股":
+            stocks = get_user_stocks(user_id)
+            if not stocks:
+                return "目前沒有持股"
+
+            msg = "📊 持股\n\n"
+            for code, d in stocks.items():
+                msg += f"{d['name']} ({code})\n成本:{d['cost']}\n\n"
+            return msg
+
+        # 刪除
+        elif text.startswith("刪除"):
+            delete_stock(user_id, parts[1] + ".TW")
+            return "❌ 已刪除"
+
+        # 分析（🔥核心）
+        elif text.startswith("分析"):
+            stock_id = parts[1]
+
+            stocks = get_user_stocks(user_id)
+            code = stock_id + ".TW"
+
+            if code in stocks:
+                return analyze_decision(stock_id, stocks[code])
+            else:
+                return analyze_decision(stock_id)
+
+        return "❌ 指令錯誤"
+
+    except Exception as e:
+        print("CMD ERROR:", e)
+        return "❌ 系統錯誤"
+
+# =========================
+# 🔁 自動監控
+# =========================
+last_status = {}
+
+def auto_loop():
+    while True:
+        try:
+            users = db.collection("users").stream()
+
+            for user in users:
+                user_id = user.id
+                stocks = get_user_stocks(user_id)
+
+                for code, data in stocks.items():
+                    msg = analyze_decision(code.replace(".TW", ""), data)
+
+                    key = user_id + code
+                    if last_status.get(key) != msg:
+                        last_status[key] = msg
+                        push_line(user_id, msg)
+
+        except Exception as e:
+            print("LOOP ERROR:", e)
+
+        time.sleep(600)
+
+threading.Thread(target=auto_loop).start()
+
+# =========================
+# 🔥 Webhook
 # =========================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -190,19 +240,17 @@ def webhook():
             text = event["message"]["text"]
 
             reply = handle_command(text, user_id)
-
             reply_line(event["replyToken"], reply)
 
     return "OK"
 
 # =========================
-# 🔥 Keep Alive（防睡眠）
+# 🔥 防睡眠
 # =========================
 def keep_alive():
     while True:
         try:
             requests.get("https://你的網址.onrender.com")
-            print("🔥 keep alive")
         except:
             pass
         time.sleep(300)
