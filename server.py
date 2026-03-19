@@ -74,26 +74,37 @@ def delete_stock(user_id, stock_id):
 # =========================
 def get_price(stock_id):
     try:
-        market = "tse" if int(stock_id) >= 1000 else "otc"
+        stock_id = stock_id.replace(".TW", "")
 
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw"
-        res = requests.get(url, timeout=5).json()
+        # 🔥 正確 URL（關鍵）
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
 
-        if not res["msgArray"]:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        res = requests.get(url, headers=headers, timeout=5).json()
+
+        if not res.get("msgArray"):
             return None
 
         data = res["msgArray"][0]
 
+        # 最新成交價
         price = data.get("z")
+
+        # fallback
         if price == "-" or price is None:
             price = data.get("b") or data.get("a")
+
+        if price is None or price == "-":
+            return None
 
         return float(price)
 
     except Exception as e:
         print("price error:", e)
         return None
-
 # =========================
 # 🔥 抓名稱
 # =========================
