@@ -72,34 +72,19 @@ def delete_stock(user_id, stock_id):
 # =========================
 # 🔥 即時股價（TWSE）
 # =========================
+import yfinance as yf
+
 def get_price(stock_id):
     try:
         stock_id = stock_id.replace(".TW", "")
+        ticker = yf.Ticker(f"{stock_id}.TW")
 
-        # 🔥 正確 URL（關鍵）
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
+        data = ticker.history(period="1d")
 
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
-        res = requests.get(url, headers=headers, timeout=5).json()
-
-        if not res.get("msgArray"):
+        if data.empty:
             return None
 
-        data = res["msgArray"][0]
-
-        # 最新成交價
-        price = data.get("z")
-
-        # fallback
-        if price == "-" or price is None:
-            price = data.get("b") or data.get("a")
-
-        if price is None or price == "-":
-            return None
-
+        price = data["Close"].iloc[-1]
         return float(price)
 
     except Exception as e:
@@ -254,21 +239,21 @@ def handle_command(text, user_id):
             delete_stock(user_id, parts[1] + ".TW")
             return "❌ 已刪除"
 
-        elif text.startswith("分析"):
-            stock_id = parts[1]
-            stocks = get_user_stocks(user_id)
-            code = stock_id + ".TW"
+    elif text.startswith("分析"):
+    parts = text.split()
 
-            if code in stocks:
-                result = analyze(stock_id, stocks[code])
-                if result is None:
-                    return "❌ 抓不到資料"
+    if len(parts) < 2:
+        reply_text = "❌ 用法：分析 2330"
+    else:
+        stock_id = parts[1].replace(".TW", "")
 
-                price, profit, decision = result
+        price = get_price(stock_id)
 
-                return f"""📊 {stocks[code]['name']}
-現價：{price}
-報酬：{profit:.2f}%
+        if price is None:
+            reply_text = "❌ 抓不到資料（可能非交易時間）"
+        else:
+            reply_text = f"""📊 {stock_id}
+現價：{price}"""
 
 👉 建議：{decision}
 """
