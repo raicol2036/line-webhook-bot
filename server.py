@@ -1,307 +1,179 @@
-from flask import Flask, request
-import requests
-import os
-import json
-import threading
+import yfinance as yf
 import time
+from flask import Flask, request
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# ====== LINE ======
+LINE_CHANNEL_ACCESS_TOKEN = "你的token"
+LINE_CHANNEL_SECRET = "你的secret"
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# ====== Firebase ======
+cred = credentials.Certificate("firebase-key.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 app = Flask(__name__)
 
-# =========================
-# 🔥 Firebase
-# =========================
-db = None
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-
-    if not firebase_admin._apps:
-        cred_json = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
-        cred = credentials.Certificate(cred_json)
-        firebase_admin.initialize_app(cred)
-
-    db = firestore.client()
-    print("✅ Firebase OK")
-except Exception as e:
-    print("❌ Firebase error:", e)
-
-# =========================
-# 🔥 LINE
-# =========================
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_TOKEN")
-
-def reply_line(reply_token, text):
-    requests.post(
-        'https://api.line.me/v2/bot/message/reply',
-        headers={
-            'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
-            'Content-Type': 'application/json'
-        },
-        json={
-            "replyToken": reply_token,
-            "messages":[{"type":"text","text": text}]
-        }
-    )
-
-def push_line(user_id, text):
-    requests.post(
-        'https://api.line.me/v2/bot/message/push',
-        headers={
-            'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
-            'Content-Type': 'application/json'
-        },
-        json={
-            "to": user_id,
-            "messages":[{"type":"text","text": text}]
-        }
-    )
-
-# =========================
-# 🔥 Firebase CRUD
-# =========================
-def get_user_stocks(user_id):
-    docs = db.collection("users").document(user_id).collection("stocks").stream()
-    return {doc.id: doc.to_dict() for doc in docs}
-
-def add_stock(user_id, stock_id, data):
-    db.collection("users").document(user_id).collection("stocks").document(stock_id).set(data)
-
-def delete_stock(user_id, stock_id):
-    db.collection("users").document(user_id).collection("stocks").document(stock_id).delete()
-
-# =========================
-# 🔥 即時股價（TWSE）
-# =========================
-import yfinance as yf
-
+# ====== 取得股價 ======
 def get_price(stock_id):
     try:
         stock_id = stock_id.replace(".TW", "")
         ticker = yf.Ticker(f"{stock_id}.TW")
-
         data = ticker.history(period="1d")
 
         if data.empty:
             return None
 
-        price = data["Close"].iloc[-1]
-        return float(price)
+        return float(data["Close"].iloc[-1])
 
-    except Exception as e:
-        print("price error:", e)
-        return None
-# =========================
-# 🔥 抓名稱
-# =========================
-def get_name(stock_id):
-    try:
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw"
-        res = requests.get(url).json()
-
-        if res["msgArray"]:
-            return res["msgArray"][0]["n"]
     except:
-        pass
+        return None
 
-    return stock_id
 
-# =========================
-# 🧠 AI判斷
-# =========================
-def analyze(stock_id, config):
+# ====== 分析 ======
+def analyze(stock_id, cost):
     price = get_price(stock_id)
     if price is None:
-        return None
+        return None, "❌ 無法取得價格"
 
-    cost = config["cost"]
-    name = config["name"]
+    change = (price - cost) / cost * 100
 
-    profit = (price - cost) / cost * 100
-
-    if price < config["stop_loss"]:
-        decision = "🚨 停損"
-    elif price > config["take_profit"]:
-        decision = "💰 停利"
+    if change <= -10:
+        return price, "🚨 停損"
+    elif change >= 20:
+        return price, "💰 停利"
+    elif change < 0:
+        return price, "⚠️ 觀察"
     else:
-        decision = "✅ 持有"
+        return price, "✅ 持有"
 
-    return price, profit, decision
 
-# =========================
-# 🔥 推播控制
-# =========================
-last_state = {}
-
-# =========================
-# 🔁 即時推播
-# =========================
-def realtime_loop():
+# ====== 自動監控 ======
+def monitor():
     while True:
-        try:
-            users = db.collection("users").stream()
+        users = db.collection("stocks").stream()
 
-            for user in users:
-                user_id = user.id
-                stocks = get_user_stocks(user_id)
+        for user in users:
+            user_id = user.id
+            stocks = user.to_dict()
 
-                for code, config in stocks.items():
-                    stock_id = code.replace(".TW", "")
-                    result = analyze(stock_id, config)
+            for stock_id, data in stocks.items():
+                cost = float(data["cost"])
 
-                    if result is None:
-                        continue
+                price, action = analyze(stock_id, cost)
 
-                    price, profit, decision = result
-                    state = f"{decision}-{round(price,1)}"
-
-                    key = f"{user_id}-{code}"
-
-                    if last_state.get(key) == state:
-                        continue
-
-                    last_state[key] = state
-
-                    msg = f"""📊 {config['name']}
-現價：{price}
-報酬：{profit:.2f}%
-
-👉 狀態：{decision}
-"""
-                    push_line(user_id, msg)
-
-        except Exception as e:
-            print("LOOP ERROR:", e)
-
-        time.sleep(10)
-
-threading.Thread(target=realtime_loop).start()
-
-# =========================
-# 🤖 指令
-# =========================
-def handle_command(text, user_id):
-    text = text.strip()
-    parts = text.split()
-
-    try:
-        # 🔥 新增（簡化 + 完整）
-        if text.startswith("新增"):
-            if len(parts) == 3:
-                _, stock_id, cost = parts
-
-                cost = float(cost)
-                if cost == 0:
-                    cost = get_price(stock_id)
-
-                name = get_name(stock_id)
-
-                tp = round(cost * 1.2, 2)
-                sl = round(cost * 0.9, 2)
-
-                add_stock(user_id, stock_id + ".TW", {
-                    "name": name,
-                    "cost": cost,
-                    "take_profit": tp,
-                    "stop_loss": sl
-                })
-
-                return f"""✅ 已新增 {name}
-成本：{cost}
-停利：{tp}
-停損：{sl}
-"""
-
-            elif len(parts) == 6:
-                _, stock_id, name, cost, tp, sl = parts
-
-                add_stock(user_id, stock_id + ".TW", {
-                    "name": name,
-                    "cost": float(cost),
-                    "take_profit": float(tp),
-                    "stop_loss": float(sl)
-                })
-
-                return f"✅ 已新增 {name}"
-
-            return "❌ 用法：新增 2330 600"
-
-        elif text == "持股":
-            stocks = get_user_stocks(user_id)
-            if not stocks:
-                return "目前沒有持股"
-
-            msg = "📊 持股\n\n"
-            for code, d in stocks.items():
-                msg += f"{d['name']} ({code})\n成本:{d['cost']}\n\n"
-            return msg
-
-        elif text.startswith("刪除"):
-            delete_stock(user_id, parts[1] + ".TW")
-            return "❌ 已刪除"
-
-    elif text.startswith("分析"):
-    parts = text.split()
-
-    if len(parts) < 2:
-        reply_text = "❌ 用法：分析 2330"
-    else:
-        stock_id = parts[1].replace(".TW", "")
-
-        price = get_price(stock_id)
-
-        if price is None:
-            reply_text = "❌ 抓不到資料（可能非交易時間）"
-        else:
-            reply_text = f"""📊 {stock_id}
-現價：{price}"""
-
-👉 建議：{decision}
-"""
-            else:
-                price = get_price(stock_id)
                 if price is None:
-                    return "❌ 抓不到資料"
+                    continue
 
-                return f"📊 {stock_id}\n現價：{price}"
+                change = (price - cost) / cost * 100
 
-        return "❌ 指令錯誤"
+                # 🔥 只推播重要訊號
+                if action in ["🚨 停損", "💰 停利"]:
 
-    except Exception as e:
-        print("CMD ERROR:", e)
-        return "❌ 系統錯誤"
+                    msg = f"""📊 {stock_id}
+現價：{price:.2f}
+成本：{cost}
+報酬：{change:.1f}%
+👉 {action}"""
 
-# =========================
-# 🔥 Webhook
-# =========================
-@app.route("/webhook", methods=["POST"])
+                    try:
+                        line_bot_api.push_message(user_id, TextSendMessage(text=msg))
+                    except:
+                        pass
+
+        time.sleep(60)  # 每1分鐘
+
+
+# ====== Webhook ======
+@app.route("/webhook", methods=['POST'])
 def webhook():
-    data = request.json
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    handler.handle(body, signature)
+    return 'OK'
 
-    for event in data.get("events", []):
-        if event["type"] == "message":
-            user_id = event["source"]["userId"]
-            text = event["message"]["text"]
 
-            reply = handle_command(text, user_id)
-            reply_line(event["replyToken"], reply)
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    text = event.message.text.strip()
+    user_id = event.source.user_id
 
-    return "OK"
+    # ===== 新增 =====
+    if text.startswith("新增"):
+        parts = text.split()
 
-# =========================
-# 🔥 防睡眠
-# =========================
-def keep_alive():
-    while True:
-        try:
-            requests.get("https://你的網址.onrender.com")
-        except:
-            pass
-        time.sleep(300)
+        if len(parts) < 3:
+            reply = "❌ 用法：新增 2330 600"
+        else:
+            stock_id = parts[1]
+            cost = float(parts[2])
 
-threading.Thread(target=keep_alive).start()
+            db.collection("stocks").document(user_id).set({
+                stock_id: {"cost": cost}
+            }, merge=True)
 
-# =========================
-# 🚀 啟動
-# =========================
+            reply = f"✅ 已新增 {stock_id}"
+
+    # ===== 持股 =====
+    elif text == "持股":
+        doc = db.collection("stocks").document(user_id).get()
+
+        if not doc.exists:
+            reply = "目前沒有持股"
+        else:
+            stocks = doc.to_dict()
+            reply = "📊 持股\n\n"
+
+            for stock_id, data in stocks.items():
+                cost = float(data["cost"])
+                price, action = analyze(stock_id, cost)
+
+                if price is None:
+                    reply += f"{stock_id} ❌ 無法取得價格\n\n"
+                else:
+                    change = (price - cost) / cost * 100
+
+                    reply += f"""📊 {stock_id}
+成本：{cost}
+現價：{price:.2f}
+報酬：{change:.1f}%
+👉 {action}
+
+"""
+
+    # ===== 分析 =====
+    elif text.startswith("分析"):
+        parts = text.split()
+
+        if len(parts) < 2:
+            reply = "❌ 用法：分析 2330"
+        else:
+            stock_id = parts[1]
+            price = get_price(stock_id)
+
+            if price is None:
+                reply = "❌ 抓不到資料"
+            else:
+                reply = f"📊 {stock_id}\n現價：{price:.2f}"
+
+    else:
+        reply = "指令：新增 / 持股 / 分析"
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply)
+    )
+
+
+# ====== 啟動 ======
+import threading
+threading.Thread(target=monitor).start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run()
