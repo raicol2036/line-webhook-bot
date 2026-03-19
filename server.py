@@ -133,22 +133,48 @@ def handle_command(text, user_id):
         # =====================
         # 分析
         # =====================
-        elif text.startswith("分析"):
-            if len(parts) != 2:
-                return "用法：分析 2330"
+def analyze_decision(stock_id):
+    try:
+        code = stock_id + ".TW"
+        df = yf.Ticker(code).history(period="1mo")
 
-            code = parts[1] + ".TW"
-            price = get_price(code)
+        if df.empty:
+            return f"❌ 抓不到 {stock_id}"
 
-            if price is None:
-                return "❌ 抓不到資料"
+        # 指標
+        df['MA5'] = df['Close'].rolling(5).mean()
+        df['MA20'] = df['Close'].rolling(20).mean()
 
-            return f"📊 {code}\n現價：{price:.2f}"
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
 
-        return "❌ 指令錯誤"
+        latest = df.iloc[-1]
+
+        price = latest['Close']
+        ma5 = latest['MA5']
+        ma20 = latest['MA20']
+        rsi = latest['RSI']
+
+        # 🔥 判斷
+        if rsi > 80:
+            decision = "⚠️ 過熱建議賣出"
+        elif ma5 < ma20:
+            decision = "⚠️ 轉弱（減碼）"
+        else:
+            decision = "✅ 多頭續抱"
+
+        return f"""📊 {stock_id}
+現價：{price:.2f}
+RSI：{rsi:.1f}
+
+👉 建議：{decision}
+"""
 
     except Exception as e:
-        print("ERROR:", e)
+        print(e)
         return "❌ 系統錯誤"
 
 # =========================
