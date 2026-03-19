@@ -4,7 +4,6 @@ import os
 import json
 import threading
 import time
-import yfinance as yf
 
 app = Flask(__name__)
 
@@ -12,7 +11,6 @@ app = Flask(__name__)
 # 🔥 Firebase
 # =========================
 db = None
-
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -24,7 +22,6 @@ try:
 
     db = firestore.client()
     print("✅ Firebase OK")
-
 except Exception as e:
     print("❌ Firebase error:", e)
 
@@ -73,72 +70,115 @@ def delete_stock(user_id, stock_id):
     db.collection("users").document(user_id).collection("stocks").document(stock_id).delete()
 
 # =========================
-# 📊 分析核心
+# 🔥 即時股價（TWSE）
 # =========================
-def analyze_decision(stock_id, config=None):
+def get_price(stock_id):
     try:
-        code = stock_id + ".TW"
-        df = yf.Ticker(code).history(period="1mo")
+        market = "tse" if int(stock_id) >= 1000 else "otc"
 
-        if df.empty:
-            return f"❌ 抓不到 {stock_id}"
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw"
+        res = requests.get(url, timeout=5).json()
 
-        df['MA5'] = df['Close'].rolling(5).mean()
-        df['MA20'] = df['Close'].rolling(20).mean()
+        if not res["msgArray"]:
+            return None
 
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        data = res["msgArray"][0]
 
-        latest = df.iloc[-1]
+        price = data.get("z")
+        if price == "-" or price is None:
+            price = data.get("b") or data.get("a")
 
-        price = latest['Close']
-        ma5 = latest['MA5']
-        ma20 = latest['MA20']
-        rsi = latest['RSI']
-
-        decision = ""
-        if config:
-            cost = config["cost"]
-            profit = (price - cost) / cost * 100
-
-            if price < config["stop_loss"]:
-                decision = "🚨 停損"
-            elif price > config["take_profit"]:
-                decision = "💰 停利"
-            elif ma5 < ma20:
-                decision = "⚠️ 轉弱"
-            else:
-                decision = "✅ 續抱"
-
-            return f"""📊 {config['name']}
-現價：{price:.2f}
-報酬：{profit:.2f}%
-RSI：{rsi:.1f}
-
-👉 建議：{decision}
-"""
-
-        # 單純查詢
-        if rsi > 80:
-            decision = "⚠️ 過熱建議賣出"
-        elif ma5 < ma20:
-            decision = "⚠️ 轉弱"
-        else:
-            decision = "✅ 多頭續抱"
-
-        return f"""📊 {stock_id}
-現價：{price:.2f}
-RSI：{rsi:.1f}
-
-👉 建議：{decision}
-"""
+        return float(price)
 
     except Exception as e:
-        print(e)
-        return "❌ 系統錯誤"
+        print("price error:", e)
+        return None
+
+# =========================
+# 🔥 抓名稱
+# =========================
+def get_name(stock_id):
+    try:
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw"
+        res = requests.get(url).json()
+
+        if res["msgArray"]:
+            return res["msgArray"][0]["n"]
+    except:
+        pass
+
+    return stock_id
+
+# =========================
+# 🧠 AI判斷
+# =========================
+def analyze(stock_id, config):
+    price = get_price(stock_id)
+    if price is None:
+        return None
+
+    cost = config["cost"]
+    name = config["name"]
+
+    profit = (price - cost) / cost * 100
+
+    if price < config["stop_loss"]:
+        decision = "🚨 停損"
+    elif price > config["take_profit"]:
+        decision = "💰 停利"
+    else:
+        decision = "✅ 持有"
+
+    return price, profit, decision
+
+# =========================
+# 🔥 推播控制
+# =========================
+last_state = {}
+
+# =========================
+# 🔁 即時推播
+# =========================
+def realtime_loop():
+    while True:
+        try:
+            users = db.collection("users").stream()
+
+            for user in users:
+                user_id = user.id
+                stocks = get_user_stocks(user_id)
+
+                for code, config in stocks.items():
+                    stock_id = code.replace(".TW", "")
+                    result = analyze(stock_id, config)
+
+                    if result is None:
+                        continue
+
+                    price, profit, decision = result
+                    state = f"{decision}-{round(price,1)}"
+
+                    key = f"{user_id}-{code}"
+
+                    if last_state.get(key) == state:
+                        continue
+
+                    last_state[key] = state
+
+                    msg = f"""📊 {config['name']}
+現價：{price}
+報酬：{profit:.2f}%
+
+👉 狀態：{decision}
+"""
+                    push_line(user_id, msg)
+
+        except Exception as e:
+            print("LOOP ERROR:", e)
+
+        time.sleep(10)
+
+threading.Thread(target=realtime_loop).start()
 
 # =========================
 # 🤖 指令
@@ -148,23 +188,47 @@ def handle_command(text, user_id):
     parts = text.split()
 
     try:
-        # 新增
+        # 🔥 新增（簡化 + 完整）
         if text.startswith("新增"):
-            if len(parts) != 6:
-                return "❌ 用法：新增 2330 台積電 600 700 550"
+            if len(parts) == 3:
+                _, stock_id, cost = parts
 
-            _, stock_id, name, cost, tp, sl = parts
+                cost = float(cost)
+                if cost == 0:
+                    cost = get_price(stock_id)
 
-            add_stock(user_id, stock_id + ".TW", {
-                "name": name,
-                "cost": float(cost),
-                "take_profit": float(tp),
-                "stop_loss": float(sl)
-            })
+                name = get_name(stock_id)
 
-            return f"✅ 已新增 {name}"
+                tp = round(cost * 1.2, 2)
+                sl = round(cost * 0.9, 2)
 
-        # 持股
+                add_stock(user_id, stock_id + ".TW", {
+                    "name": name,
+                    "cost": cost,
+                    "take_profit": tp,
+                    "stop_loss": sl
+                })
+
+                return f"""✅ 已新增 {name}
+成本：{cost}
+停利：{tp}
+停損：{sl}
+"""
+
+            elif len(parts) == 6:
+                _, stock_id, name, cost, tp, sl = parts
+
+                add_stock(user_id, stock_id + ".TW", {
+                    "name": name,
+                    "cost": float(cost),
+                    "take_profit": float(tp),
+                    "stop_loss": float(sl)
+                })
+
+                return f"✅ 已新增 {name}"
+
+            return "❌ 用法：新增 2330 600"
+
         elif text == "持股":
             stocks = get_user_stocks(user_id)
             if not stocks:
@@ -175,57 +239,40 @@ def handle_command(text, user_id):
                 msg += f"{d['name']} ({code})\n成本:{d['cost']}\n\n"
             return msg
 
-        # 刪除
         elif text.startswith("刪除"):
             delete_stock(user_id, parts[1] + ".TW")
             return "❌ 已刪除"
 
-        # 分析（🔥核心）
         elif text.startswith("分析"):
             stock_id = parts[1]
-
             stocks = get_user_stocks(user_id)
             code = stock_id + ".TW"
 
             if code in stocks:
-                return analyze_decision(stock_id, stocks[code])
+                result = analyze(stock_id, stocks[code])
+                if result is None:
+                    return "❌ 抓不到資料"
+
+                price, profit, decision = result
+
+                return f"""📊 {stocks[code]['name']}
+現價：{price}
+報酬：{profit:.2f}%
+
+👉 建議：{decision}
+"""
             else:
-                return analyze_decision(stock_id)
+                price = get_price(stock_id)
+                if price is None:
+                    return "❌ 抓不到資料"
+
+                return f"📊 {stock_id}\n現價：{price}"
 
         return "❌ 指令錯誤"
 
     except Exception as e:
         print("CMD ERROR:", e)
         return "❌ 系統錯誤"
-
-# =========================
-# 🔁 自動監控
-# =========================
-last_status = {}
-
-def auto_loop():
-    while True:
-        try:
-            users = db.collection("users").stream()
-
-            for user in users:
-                user_id = user.id
-                stocks = get_user_stocks(user_id)
-
-                for code, data in stocks.items():
-                    msg = analyze_decision(code.replace(".TW", ""), data)
-
-                    key = user_id + code
-                    if last_status.get(key) != msg:
-                        last_status[key] = msg
-                        push_line(user_id, msg)
-
-        except Exception as e:
-            print("LOOP ERROR:", e)
-
-        time.sleep(600)
-
-threading.Thread(target=auto_loop).start()
 
 # =========================
 # 🔥 Webhook
