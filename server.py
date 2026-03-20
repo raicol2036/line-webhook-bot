@@ -1,5 +1,8 @@
-import yfinance as yf
+import os
 import time
+import threading
+import requests
+import yfinance as yf
 from flask import Flask, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -20,25 +23,51 @@ db = firestore.client()
 
 app = Flask(__name__)
 
-# ====== 取得股價 ======
+# ====== 防重複通知 ======
+last_alerts = {}
+
+# ====== 取得股價（雙API保底） ======
 def get_price(stock_id):
     try:
         stock_id = stock_id.replace(".TW", "")
-        ticker = yf.Ticker(f"{stock_id}.TW")
-        data = ticker.history(period="1d")
 
-        if data.empty:
-            return None
+        # 🥇 yfinance
+        try:
+            ticker = yf.Ticker(f"{stock_id}.TW")
+            data = ticker.history(period="1d")
 
-        return float(data["Close"].iloc[-1])
+            if not data.empty:
+                return float(data["Close"].iloc[-1])
+        except:
+            pass
 
-    except:
+        # 🥈 TWSE API
+        try:
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
+            headers = {"User-Agent": "Mozilla/5.0"}
+
+            res = requests.get(url, headers=headers, timeout=5).json()
+
+            if res.get("msgArray"):
+                data = res["msgArray"][0]
+                price = data.get("z")
+
+                if price and price != "-":
+                    return float(price)
+        except:
+            pass
+
+        return None
+
+    except Exception as e:
+        print("price error:", e)
         return None
 
 
 # ====== 分析 ======
 def analyze(stock_id, cost):
     price = get_price(stock_id)
+
     if price is None:
         return None, "❌ 無法取得價格"
 
@@ -57,45 +86,55 @@ def analyze(stock_id, cost):
 # ====== 自動監控 ======
 def monitor():
     while True:
-        users = db.collection("stocks").stream()
+        try:
+            users = db.collection("stocks").stream()
 
-        for user in users:
-            user_id = user.id
-            stocks = user.to_dict()
+            for user in users:
+                user_id = user.id
+                stocks = user.to_dict()
 
-            for stock_id, data in stocks.items():
-                cost = float(data["cost"])
+                for stock_id, data in stocks.items():
+                    cost = float(data["cost"])
 
-                price, action = analyze(stock_id, cost)
+                    price, action = analyze(stock_id, cost)
 
-                if price is None:
-                    continue
+                    if price is None:
+                        continue
 
-                change = (price - cost) / cost * 100
+                    change = (price - cost) / cost * 100
+                    key = f"{user_id}_{stock_id}"
 
-                # 🔥 只推播重要訊號
-                if action in ["🚨 停損", "💰 停利"]:
+                    # 🔥 防重複通知
+                    if action in ["🚨 停損", "💰 停利"]:
+                        if last_alerts.get(key) == action:
+                            continue
 
-                    msg = f"""📊 {stock_id}
+                        msg = f"""📊 {stock_id}
 現價：{price:.2f}
 成本：{cost}
 報酬：{change:.1f}%
 👉 {action}"""
 
-                    try:
                         line_bot_api.push_message(user_id, TextSendMessage(text=msg))
-                    except:
-                        pass
+                        last_alerts[key] = action
 
-        time.sleep(60)  # 每1分鐘
+        except Exception as e:
+            print("monitor error:", e)
+
+        time.sleep(60)
 
 
 # ====== Webhook ======
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
-    handler.handle(body, signature)
+
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("webhook error:", e)
+
     return 'OK'
 
 
@@ -111,7 +150,7 @@ def handle_message(event):
         if len(parts) < 3:
             reply = "❌ 用法：新增 2330 600"
         else:
-            stock_id = parts[1]
+            stock_id = parts[1].replace(".TW", "")
             cost = float(parts[2])
 
             db.collection("stocks").document(user_id).set({
@@ -135,7 +174,11 @@ def handle_message(event):
                 price, action = analyze(stock_id, cost)
 
                 if price is None:
-                    reply += f"{stock_id} ❌ 無法取得價格\n\n"
+                    reply += f"""📊 {stock_id}
+成本：{cost}
+❌ 無法取得價格
+
+"""
                 else:
                     change = (price - cost) / cost * 100
 
@@ -154,13 +197,14 @@ def handle_message(event):
         if len(parts) < 2:
             reply = "❌ 用法：分析 2330"
         else:
-            stock_id = parts[1]
+            stock_id = parts[1].replace(".TW", "")
             price = get_price(stock_id)
 
             if price is None:
-                reply = "❌ 抓不到資料"
+                reply = f"❌ {stock_id} 抓不到資料"
             else:
-                reply = f"📊 {stock_id}\n現價：{price:.2f}"
+                reply = f"""📊 {stock_id}
+現價：{price:.2f}"""
 
     else:
         reply = "指令：新增 / 持股 / 分析"
@@ -172,8 +216,13 @@ def handle_message(event):
 
 
 # ====== 啟動 ======
-import threading
-threading.Thread(target=monitor).start()
+def start_monitor():
+    t = threading.Thread(target=monitor)
+    t.daemon = True
+    t.start()
+
+
+start_monitor()
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
