@@ -17,7 +17,10 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ====== Firebase ======
-cred = credentials.Certificate("firebase-key.json")
+import json
+
+firebase_json = json.loads(os.environ["FIREBASE_KEY"])
+cred = credentials.Certificate(firebase_json)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
